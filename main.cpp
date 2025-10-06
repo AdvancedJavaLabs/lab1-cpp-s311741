@@ -1,60 +1,136 @@
+#include "digraph.hpp"
+#include <algorithm>
+#include <cassert>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <vector>
-#include "Graph.h"
-#include "RandomGraphGenerator.h"
+#include <numeric>
+#include <fmt/core.h>
+#include <fmt/chrono.h>
+#include <fmt/color.h>
 
-static long long executeSerialBfsAndGetTime(Graph& g) {
-    auto start = std::chrono::steady_clock::now();
-    g.bfs(0);
-    auto end = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+#if 1
+struct xorshift128 {
+  using result_type = uint64_t;
+  constexpr static result_type max() { return UINT64_MAX; }
+  constexpr static result_type min() { return 0; }
+
+  explicit xorshift128() = default;
+  explicit xorshift128(uint64_t s): a(s), b(s) {}
+  explicit xorshift128(uint64_t a, uint64_t b): a(a), b(b) {}
+
+  uint64_t a = 0xfe48ec23c5fb18e0;
+  uint64_t b = 0xac5f64acb55eda12;
+
+  result_type operator()() {
+    uint64_t x = a, y = b;
+    a = b;
+    x ^= x << 23;
+    b = x ^ y ^ (x >> 17) ^ (y >> 26);
+    return b + y;
+  }
+};
+using rng = xorshift128;
+#else
+#include <random>
+using rng = std::mt19937_64;
+#endif
+
+template<typename Rng>
+[[gnu::noinline]]
+digraph make_random_digraph(Rng& rng, int n_verts, int n_edges) {
+  assert(n_verts > 1);
+  assert(n_edges >= n_verts-1);
+  assert(n_edges <= long(n_verts) * (n_verts - 1));
+
+  digraph g(n_verts);
+
+  {
+    std::vector<int> perm(n_verts);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), rng);
+    for (int i = 1; i < n_verts; ++i) {
+      g.maybe_add_edge(perm[i-1], perm[i]);
+    }
+    if (n_edges >= n_verts) {
+      g.maybe_add_edge(perm[n_verts-1], perm[0]);
+    }
+  }
+
+  std::uniform_int_distribution<int> dist(0, n_verts-1);
+
+#if 1
+  for (int from = 0; from < n_verts; ++from) {
+    int wantout = std::min(n_verts-1, n_edges / n_verts);
+    while (std::ssize(g.adj[from]) < wantout) {
+      g.maybe_add_edge(from, dist(rng));
+    }
+  }
+#endif
+
+  while (g.num_edges < n_edges) {
+    g.maybe_add_edge(dist(rng), dist(rng));
+  }
+
+  assert(g.num_edges == n_edges);
+  return g;
 }
 
-static long long executeParallelBfsAndGetTime(Graph& g) {
-    auto start = std::chrono::steady_clock::now();
-    g.parallelBFS(0); // заглушка
-    auto end = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-}
+struct timer {
+  using clock = std::chrono::steady_clock;
+  clock::time_point started = clock::now();
+
+  using dmilliseconds = std::chrono::duration<double, std::milli>;
+
+  dmilliseconds measure() const {
+    return std::chrono::duration_cast<dmilliseconds>(clock::now() - started);
+  };
+};
 
 int main() {
-    try {
-        std::vector<int> sizes       = {10, 100, 1000, 10000, 10000, 50000, 100000, 1000000, 2000000, 20000000};
-        std::vector<int> connections = {50, 500, 5000, 50000, 100000, 1000000, 1000000, 10000000, 10000000, 50000000};
+  constexpr static struct { int v, e; } configs[] = {
+    { 10, 50 },
+    { 100, 500 },
+    { 1000, 5000 },
+    { 10'000, 50'000 },
+    { 50'000, 1000'000 },
+    { 100'000, 1000'000 },
+    { 250'000, 249'999 },
+    { 2000'000, 10'000'000 },
+    { 20'000'000, 50'000'000 },
+    { 20'000'000, 100'000'000 },
+    { 20'000'000, 500'000'000 },
+  };
 
-        std::mt19937_64 r(42);
+  std::vector<int> depths_seq(100'000'000);
+  std::vector<int> depths_par(100'000'000);
+  constexpr int n_threads = 4;
 
-        std::filesystem::create_directories("tmp");
-        std::ofstream fw("tmp/results.txt");
-        if (!fw) {
-            std::cerr << "Failed to open tmp/results.txt for writing\n";
-            return 1;
-        }
+  rng rng;
+  for (auto [v, e]: configs) {
+    digraph g = make_random_digraph(rng, v, e);
 
-        RandomGraphGenerator gen;
+    auto seq_span = std::span(depths_seq).subspan(0, v);
+    auto par_span = std::span(depths_par).subspan(0, v);
 
-        for (size_t i = 0; i < sizes.size(); ++i) {
-            std::cout << "--------------------------\n";
-            std::cout << "Generating graph of size " << sizes[i] << " ... wait\n";
-            Graph g = gen.generateGraph(r, sizes[i], connections[i]);
-            std::cout << "Generation completed!\nStarting bfs\n";
-            long long serialTime = executeSerialBfsAndGetTime(g);
-            long long parallelTime = executeParallelBfsAndGetTime(g);
+    timer seq_timer;
+    bfs(g, seq_span);
+    auto seq_time = seq_timer.measure();
 
-            fw << "Times for " << sizes[i] << " vertices and " << connections[i] << " connections: ";
-            fw << "\nSerial: " << serialTime;
-            fw << "\nParallel: " << parallelTime;
-            fw << "\n--------\n";
-            fw.flush();
-        }
+    timer par_timer;
+    parallel_bfs(n_threads, g, par_span);
+    auto par_time = par_timer.measure();
 
-        std::cout << "Done. Results in tmp/results.txt\n";
-    } catch (const std::exception& ex) {
-        std::cerr << "Exception: " << ex.what() << "\n";
-        return 2;
-    }
-    return 0;
+    bool equal = std::ranges::equal(seq_span, par_span);
+
+    constexpr auto green = fg(fmt::color::green);
+    constexpr auto red = fg(fmt::color::red);
+    using namespace std::literals;
+
+    fmt::print(
+      "{}v / {}e\tseq bfs: {}\tpar bfs ({} threads): {}.\tresult {}\n",
+      v, e,
+      styled(seq_time, seq_time < par_time ? green : red),
+      n_threads,
+      styled(par_time, par_time < seq_time ? green : red),
+      equal ? styled("matches"sv, green) : styled("mismatch"sv, red));
+  }
 }
