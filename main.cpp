@@ -2,11 +2,13 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <numeric>
-#include <fmt/core.h>
 #include <fmt/chrono.h>
 #include <fmt/color.h>
+#include <fmt/core.h>
+#include <fstream>
+#include <numeric>
 
+namespace {
 #if 1
 struct xorshift128 {
   using result_type = uint64_t;
@@ -84,6 +86,7 @@ struct timer {
     return std::chrono::duration_cast<dmilliseconds>(clock::now() - started);
   };
 };
+} // namespace
 
 int main() {
   constexpr static struct { int v, e; } configs[] = {
@@ -93,20 +96,25 @@ int main() {
     { 10'000, 50'000 },
     { 50'000, 1000'000 },
     { 100'000, 1000'000 },
-    { 250'000, 249'999 },
+    { 250'000, 250'000 },
     { 2000'000, 10'000'000 },
     { 20'000'000, 50'000'000 },
     { 20'000'000, 100'000'000 },
     { 20'000'000, 500'000'000 },
   };
 
-  std::vector<int> depths_seq(100'000'000);
-  std::vector<int> depths_par(100'000'000);
+  std::vector<int> depths_seq(20'000'000);
+  std::vector<int> depths_par(20'000'000);
   constexpr int n_threads = 4;
 
-  rng rng;
+  std::ofstream csv("out.csv");
+  csv << "v,e,buildtime,seqtime,partime,threads\n";
+
   for (auto [v, e]: configs) {
+    rng rng;
+    timer build_timer;
     digraph g = make_random_digraph(rng, v, e);
+    auto build_time = build_timer.measure();
 
     auto seq_span = std::span(depths_seq).subspan(0, v);
     auto par_span = std::span(depths_par).subspan(0, v);
@@ -132,5 +140,7 @@ int main() {
       n_threads,
       styled(par_time, par_time < seq_time ? green : red),
       equal ? styled("matches"sv, green) : styled("mismatch"sv, red));
+    csv << fmt::format("{},{},{},{},{},{}\n",
+      v, e, build_time.count(), seq_time.count(), par_time.count(), n_threads);
   }
 }
